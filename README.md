@@ -18,34 +18,54 @@ for additional usage information and tutorials.
 
 ## Setup
 **Packages:** The code has been tested using the `aws_neuronx_venv_pytorch_1_13` venv on 	
-Deep Learning AMI Neuron (Ubuntu 22.04), which uses `torch-neuronx==1.13.1` and `neuronx-cc-2.15`.
+Deep Learning AMI Neuron (Ubuntu 22.04), which uses `torch-neuronx==1.13.1` and `neuronx-cc==2.16`.
 See `requirements.txt` for additional dependencies.
 
 **Dataset:** Run the following script to download and tokenize the `wikicorpus` dataset for training. Set `num_proc` as
 appropriate.
-**Note:** `seq_len` must be divisible by `chunk_size` of the model (128 by default)
+**Note:** `seq_len` must be divisible by `chunk_size` of the model (128 by default) and the flash attention requires the `seq_len` >= 2048.
 ```sh
-seq_len=512
+seq_len=2048
 python tokenize_dataset.py \
   --seq_len ${seq_len} --save_path ./data/wikicorpus_${seq_len} --dataset "wikicorpus" \
   --dataset_config "raw_en" --tokenizer "EleutherAI/gpt-neox-20b" --num_proc ${num_proc}
 ```
+**Env Variables**: Set following env variables before you run the training command. 
+```sh
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --cache_dir=$HOME/neuron_compile_cache/"
+export NEURON_FUSE_SOFTMAX=1
 
+# Async Runtime
+export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
+
+# HOST OOM
+export MALLOC_ARENA_MAX=64
+```
 ## Run a training job
-
+### SSM model training
 To start a simple dry run with tensor parallelism, `bfloat16` precision and `zero1` optimizer use the following command
 (you will need to adjust the hyperparameters for an actual training run).
 **Note:** The sequence length is automatically inferred from the dataset.
 ```sh
-torchrun --nproc_per_node 32 train.py  --tp 8  --model Mamba7B  --data_dir ./data/wikicorpus_512/  --max_steps 16  --dtype bfloat16  --use_zero_1  --grad_accum_usteps 1  --lr 0.001  --checkpoint_freq 8  --checkpoint_dir ./model_save/  --tag mamba2_7b_testrun  --vocab_size 50288  --warmup_steps 5  --batch 1  --rmsnorm_across_groups  --beta1 0.9  --beta2 0.95  --weight_decay 0.1
+torchrun --nproc_per_node 32 train.py  --tp 8  --model Mamba7B  --data_dir ./data/wikicorpus_2048/  --max_steps 16  --dtype bfloat16  --use_zero_1  --grad_accum_usteps 1  --lr 0.001  --checkpoint_freq 8  --checkpoint_dir ./model_save/  --tag mamba2_7b_testrun  --vocab_size 50288  --warmup_steps 5  --batch 1  --rmsnorm_across_groups  --beta1 0.9  --beta2 0.95  --weight_decay 0.1 --sequence_parallel_enabled 
 ```
 The following script shows additional configuration options and can be adapted for multi-instance training.
 ```sh
 bash tp_zero1_mamba2_7B_pretrain.sh DATA_DIR MODEL_SAVE_DIR
 ```
 
-## For Developers
+### Hybrid model training
+Similar as above, we can launch a hybrid model training via following command
+```sh
+torchrun --nproc_per_node 32 train.py  --tp 8  --model Mamba2Hybrid8B  --data_dir ./data/wikicorpus_2048/  --max_steps 16  --dtype bfloat16  --use_zero_1  --grad_accum_usteps 1  --lr 0.001  --checkpoint_freq 8  --checkpoint_dir ./model_save/  --tag mamba2hybrid_testrun  --vocab_size 50288  --warmup_steps 5  --batch 1  --rmsnorm_across_groups  --beta1 0.9  --beta2 0.95  --weight_decay 0.1 --sequence_parallel_enabled 
+```
+The following script shows additional configuration options and can be adapted for multi-instance training.
+```sh
+bash tp_zero1_hybridmamba2_8B_pretrain.sh DATA_DIR MODEL_SAVE_DIR
+```
 
+## For Developers
+### SSM model
 The model implementation is in the folder `mamba2`. This contains:
 
 **Kernels**
@@ -53,6 +73,8 @@ The model implementation is in the folder `mamba2`. This contains:
 * `mamba2_kernel.py` implements the forward and backward Mamba2 kernel for Trainium using NKI.
 * `conv1d_grouped.py` is a custom kernel to replace the standard `nn.Conv1d`. It is optimized for grouped convolutions
   with small kernel size.
+* `mamba2_kernel_inference.py` is a custom kernel for autoregressive inference that processes one token at a time in
+  a batch from cached SSM and convolutional states.
 
 **Model**
 
@@ -67,6 +89,17 @@ The model implementation is in the folder `mamba2`. This contains:
 * `modeling_mamba2.py` implements the HuggingFace wrapper. The main changes
   are the use of `ParallelEmbedding` and `RowParallelLinear` for the embedding and final layer, again to support tensor
   parallelism.
+
+### Hybrid model
+
+**Model**
+
+* `mamba2hybrid_attn.py` implements the attention block, which based on [NxD's Llama implementation](https://github.com/aws-neuron/neuronx-distributed/blob/main/examples/training/llama/modeling_llama_nxd.py) with sequence parallelism support.
+
+* `mamba2hybrid_mlp.py` implements the MLP block, which based on [NxD's Llama implementation](https://github.com/aws-neuron/neuronx-distributed/blob/main/examples/training/llama/modeling_llama_nxd.py). It also supports sequence parallelism.
+
+* `modeling_mamba2hybrid.py` implements the HuggingFace wrapper. it can support tensor parallelism and sequence parallelism
+
 
 ## Compatibility Notes
 

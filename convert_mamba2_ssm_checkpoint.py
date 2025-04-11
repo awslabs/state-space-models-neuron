@@ -1,6 +1,6 @@
 # coding=utf-8
-# Copyright 2024 state-spaces/mamba2 org and HuggingFace Inc. team.
-# Modifications Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2025 state-spaces/mamba2 org and HuggingFace Inc. team.
+# Modifications Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,31 +13,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-This script can be used to convert checkpoints provided in the `mamba2_ssm` library into the format provided in HuggingFace `transformers`.
-It depends on the `mamba2_ssm` package to be installed.
-
-Unlike the Mamba2 implementation in transformers, we split the Mamba2Mixer.in_proj in three separate linear layer.
-This version of the script has an additional flag --split_proj to convert checkpoint to our format.
-"""
+"""This script can be used to convert checkpoints provided in the `mamba2_ssm` library into the format provided in HuggingFace `transformers`. It depends on the `mamba2_ssm` package to be installed."""
 
 import argparse
 import json
-import os
 from functools import partial
 from os import path
 from typing import Dict, Optional
 
 import torch
-import torch.distributed as dist
-import neuronx_distributed as nxd
 from safetensors import safe_open
 from safetensors.torch import save_model
 
 from transformers import GPTNeoXTokenizerFast, LlamaTokenizerFast
 from mamba2.configuration_mamba2 import Mamba2Config
 from mamba2.modeling_mamba2 import Mamba2ForCausalLM
-from neuronx_distributed.parallel_layers import parallel_state
 
 
 def load_state_dict_from_safetensors(mamba2_checkpoint_path: str, ckpt_name: str) -> Dict[str, torch.Tensor]:
@@ -167,19 +157,9 @@ def convert_mamba2_checkpoint_file_to_huggingface_model_file(
 
     # Load state dict of the original model and transfer to hf model
     original_state_dict = mamba2_model_dict["load_state_dict"](mamba2_checkpoint_path=mamba2_checkpoint_path)
-
-    def get_model():
-        model = Mamba2ForCausalLM(hf_config)
-        model.eval()
-        return model
-
-    nxd_config = nxd.neuronx_distributed_config()
-
-    hf_model = nxd.initialize_parallel_model(nxd_config, get_model)
-
+    hf_model = Mamba2ForCausalLM(hf_config)
     if split_proj:
         original_state_dict = split_projection_matrix(hf_model, original_state_dict)
-
     hf_model.load_state_dict(original_state_dict)
 
     # Save new model to pytorch_dump_path
@@ -191,9 +171,6 @@ def convert_mamba2_checkpoint_file_to_huggingface_model_file(
 
 
 if __name__ == "__main__":
-    import torch_xla.core.xla_model as xm
-
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-i",
@@ -239,18 +216,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    os.environ["NEURON_CC_FLAGS"] = " --model-type=transformer -O1"
-    if os.environ.get("WORLD_SIZE"):
-        dist.init_process_group("xla")
-        print(os.environ.get("RANK"))
-        convert_mamba2_checkpoint_file_to_huggingface_model_file(
-            args.mamba2_checkpoint_directory,
-            args.mamba2_model_type,
-            args.precision,
-            args.output_dir,
-            args.tokenizer_model_path,
-            args.split_proj
-        )
-        xm.rendezvous("_mp_fn finished")
-    else:
-        print("No process group initialized, cannot run without torchrun")
+    convert_mamba2_checkpoint_file_to_huggingface_model_file(
+        args.mamba2_checkpoint_directory,
+        args.mamba2_model_type,
+        args.precision,
+        args.output_dir,
+        args.tokenizer_model_path,
+        args.split_proj
+    )

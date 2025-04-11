@@ -12,9 +12,12 @@ import torch_xla.distributed.parallel_loader as pl
 from neuronx_distributed.utils.adamw_fp32_optim_params import AdamW_FP32OptimParams
 from transformers.optimization import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from mamba2 import Mamba2ForCausalLM
-from training_utils import create_llama_pretraining_dataset, save_checkpoint
+from mamba2.modeling_mamba2 import Mamba2ForCausalLM
+from mamba2hybrid import Mamba2HybridForCausalLM
+
+from nxd_training_utils import create_llama_pretraining_dataset
 from predefined_configs import get_config
+from utils import Logger, get_mixed_precision_config, Throughput
 
 import transformers.modeling_utils as modeling_utils
 
@@ -27,17 +30,6 @@ WORLD_SIZE = int(os.environ['WORLD_SIZE'])
 WORLD_RANK = int(os.environ['RANK'])
 
 
-def get_mixed_precision_config(args):
-    if args.use_zero_1:
-        return {
-            "use_master_weights": True,
-            "use_fp32_grad_acc": True,
-            "use_master_weights_in_ckpt": False,
-        }
-    else:
-        return {}
-
-
 def run(args, backend):
     import numpy as np
     torch.manual_seed(args.seed)
@@ -45,13 +37,32 @@ def run(args, backend):
 
     device = xm.xla_device()
 
-    config = get_config(args.model, args.vocab_size, rmsnorm_within_groups=(not args.rmsnorm_across_groups),
-                        n_groups=args.tp)
-
+    config = get_config(
+        args.model, 
+        args.vocab_size, 
+        rmsnorm_within_groups=(not args.rmsnorm_across_groups), 
+        n_groups=args.tp,
+        sequence_parallel_enabled=args.sequence_parallel_enabled,
+        dtype=args.dtype,
+    )
+    
     def get_model():
-        model = Mamba2ForCausalLM(config).to(dtype=args.dtype)
+        if 'Hybrid' in args.model:
+            model = Mamba2HybridForCausalLM(config).to(dtype=args.dtype)
+        else:
+            model = Mamba2ForCausalLM(config).to(dtype=args.dtype)
         model.train()
-
+        if args.checkpoint_load:
+            nxd.load_checkpoint(
+                args.checkpoint_load_dir,
+                tag=args.checkpoint_load_tag,
+                model=model,
+                optimizer=None,
+                scheduler=None,
+                strict=False,
+            )
+            xm.mark_step()
+            print('load sucessfully!')
         # check that weight tying worked
         if model.config.tie_word_embeddings:
             assert model.backbone.embeddings.weight is model.lm_head.weight
@@ -60,29 +71,43 @@ def run(args, backend):
     nxd_config = nxd.neuronx_distributed_config(
         tensor_parallel_size=args.tp,
         optimizer_config={"zero_one_enabled": args.use_zero_1, "grad_clipping": True, "max_grad_norm": 1.0},
-        sequence_parallel=False,
+        sequence_parallel=args.sequence_parallel_enabled,
         model_init_config=None,
         mixed_precision_config=get_mixed_precision_config(args),
     )
     model = nxd.initialize_parallel_model(nxd_config, get_model)
+    # print(f"Mamba2 Model =\n{model}")
     world_size = ps.get_data_parallel_size()
-    if xm.is_master_ordinal():
+    is_root = xm.is_master_ordinal(local=False)
+    if is_root:
         print('NEURON_CC_FLAGS: ', os.environ.get('NEURON_CC_FLAGS', None))
         print('XLA_IR_DEBUG: ', os.environ.get('XLA_IR_DEBUG', None))
         print('XLA_HLO_DEBUG: ', os.environ.get('XLA_HLO_DEBUG', None))
         print('TP groups:', ps.get_tensor_model_parallel_group(as_list=True))
         print('DP groups:', ps.get_data_parallel_group(as_list=True))
-        print('Config: ', config)
+        # print('Config: ', config)
+        print('Arguments: ', args)
         param_size, dtype = 0, None
         for param in set(model.parameters()):
             param_size += param.nelement()
             dtype = param.dtype
-        print(f"Model size: {param_size / 10 ** 6:.1f}M parameters/core")
+        print(f"Model size: {param_size / 10**6:.1f}M parameters/core")
         print(f"Param dtype: {dtype}")
+        logger = Logger(args, dtype) 
+        throughput = Throughput(
+            args.batch, 
+            world_size, 
+            args.grad_accum_usteps, 
+            tp_size=args.tp, 
+            model= args.model, 
+            seq_length=args.seq_len,
+            logging_interval=args.logging_interval,
+        )
 
     param_optimizer = list(model.named_parameters())
 
-    no_decay = ["bias", "LayerNorm", "norm", "A", "D"]
+    # fixme: what are the right parameters for mamba2?
+    no_decay = ["bias", "LayerNorm", "norm", "A", "D"]  # gamma/beta are in LayerNorm.weight
 
     optimizer_grouped_parameters = [
         {
@@ -112,7 +137,7 @@ def run(args, backend):
     if args.use_zero_1:
         optimizer.optimizer.init_zero()
 
-    scheduler = get_cosine_schedule_with_warmup(
+    scheduler =  get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
         num_training_steps=args.max_steps,
@@ -130,90 +155,86 @@ def run(args, backend):
     # care of copying the tensors to device and also inserting the mark_step at
     # iteration end.
     train_device_loader = pl.MpDeviceLoader(train_dataloader, device)
-
+    
     running_loss = torch.zeros(1).to(device)
     training_step, global_step = 0, 0
-    t0 = time.time()
     xm.mark_step()
-    for i, data in enumerate(train_device_loader):
-        training_step += 1
-        input_ids = data["input_ids"]
-        labels = data["labels"]
 
-        out = model(input_ids=input_ids, labels=labels)
-        loss = out.loss / args.grad_accum_usteps
-        loss.backward()
-        xm.mark_step()
+    def _save_checkpoint(args, global_step, model, optimizer, scheduler):
+        xm.add_step_closure(
+            nxd.save_checkpoint, (
+                args.checkpoint_dir,  # checkpoint directory
+                f"{args.tag}_step_{global_step}",  # tag
+                model,  # model
+                optimizer,  # optimizer
+                scheduler,  # scheduler
+                {"global_step": global_step, "cli_args": args.__dict__},  # user content
+                8, # num_workers
+                False, # use_xser
+                args.num_kept_checkpoint, # num_kept_ckpts
+            ),
+        )
 
-        running_loss += loss.detach()
+    while True:
+        for i, data in enumerate(train_device_loader):
+            training_step += 1
+            input_ids = data["input_ids"]
+            labels = data["labels"]
 
-        if training_step % args.grad_accum_usteps == 0:
-            xm.mark_step()
-            if xm.is_master_ordinal():
-                print(f"Global Step {global_step}")
-                print(f"Loss: {loss.item()}")
-                print(f"running_loss: {running_loss.item()}")
+            out = model(input_ids=input_ids, labels=labels)
+            loss = out.loss / args.grad_accum_usteps
+            loss.backward()
 
-            running_loss.zero_()
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-            global_step += 1
+            running_loss += loss.detach()
 
-            xm.mark_step()
-            if xm.is_master_ordinal():
-                print(f'process time of this batch is: {time.time() - t0}')
-            t0 = time.time()
-
-            if (args.checkpoint_freq > 0) and (global_step % args.checkpoint_freq == 0):
-                xm.add_step_closure(
-                    save_checkpoint, (
-                        args.checkpoint_dir,  # checkpoint directory
-                        f"{args.tag}_step_{global_step}",  # tag
-                        model,  # model
-                        optimizer,  # optimizer
-                        scheduler,  # scheduler
-                        {"global_step": global_step, "cli_args": args.__dict__},  # user content
-                    )
+            if training_step % args.grad_accum_usteps == 0:
+                xm.mark_step()
+                # loss averaging
+                running_loss_div = running_loss / world_size
+                # Collecting loss across all data-parallel ranks
+                running_loss_reduced = xm.all_reduce(
+                    xm.REDUCE_SUM,
+                    running_loss_div,
+                    groups=ps.get_data_parallel_group(as_list=True),
                 )
+                running_loss_reduced_detached = running_loss_reduced.detach()
+                running_loss.zero_()
+                
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+                global_step += 1
 
+                def _print_logs(running_loss_reduced_detached):
+                    # NOTE: The running_loss is the loss of the global_step
+                    step_time, tput, MFU = throughput.get_throughput()
+                    logger.log(
+                        global_step,
+                        running_loss_reduced_detached.cpu().item(),
+                        optimizer.param_groups[0]["lr"],
+                        step_time,
+                        tput,
+                        MFU,
+                    )
+                if is_root and global_step % args.logging_interval == 0:
+                    xm.add_step_closure(_print_logs, (running_loss_reduced_detached))
+
+                if (args.checkpoint_freq > 0) and (global_step % args.checkpoint_freq == 0):
+                    _save_checkpoint(args, global_step, model, optimizer, scheduler)
+
+            if global_step >= args.max_steps:
+                xm.mark_step()
+                break
+            
         if global_step >= args.max_steps:
-            xm.mark_step()
+            if args.save_last_step and global_step % args.checkpoint_freq:
+                _save_checkpoint(args, global_step, model, optimizer, scheduler)
             break
-        # xm.mark_step()  # final mark_step not needed when using MpDeviceLoader
-
 
 def init_processes(args, backend):
     dist.init_process_group(backend, rank=WORLD_RANK, world_size=WORLD_SIZE)
     run(args=args, backend=backend)
     xm.rendezvous("_mp_fn finished")
-
-
-def tp_loader(state_dict, tp_rank, tp_size, config):
-    """Load the correct slice of weights from a checkpoint for the current core give the tensor parallel degree."""
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.endswith('out_proj.weight'):  # row parallel
-            dim_1_shape = v.shape[1]
-            cv = torch.split(v, dim_1_shape // tp_size, dim=1)
-            new_state_dict[k] = cv[tp_rank]
-        elif k.endswith('in_proj_xBC.weight') or 'conv1d' in k:  # xBC and Conv Col para
-            wx, wB, wC = torch.split(v, [config.hidden_size * 2, config.n_groups * config.state_size,
-                                         config.n_groups * config.state_size],
-                                     dim=0)
-            wx_tp = torch.split(wx, wx.shape[0] // tp_size, dim=0)[tp_rank]
-            wB_tp = torch.split(wB, wB.shape[0] // tp_size, dim=0)[tp_rank]
-            wC_tp = torch.split(wC, wC.shape[0] // tp_size, dim=0)[tp_rank]
-            xBC_tp = torch.cat((wx_tp, wB_tp, wC_tp), dim=0)
-            new_state_dict[k] = xBC_tp
-        elif 'norm' in k and 'mixer' not in k:
-            new_state_dict[k] = v
-        else:  # norm weight and z and dt
-            dim_0_shape = v.shape[0]
-            rv = torch.split(v, dim_0_shape // tp_size, dim=0)
-            new_state_dict[k] = rv[tp_rank]
-
-    return new_state_dict
 
 
 if __name__ == '__main__':
@@ -232,6 +253,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--no_optimizer_fp32", action="store_true", help="Do not use FP32 for the optimizer state.")
     parser.add_argument("--use_zero_1", action="store_true", help="Use ZeRO-1.")
+    parser.add_argument("--sequence_parallel_enabled", action="store_true", help="Use sequence parallelism.")
     parser.add_argument("--lr", type=float, default=4e-4, help="Learning rate.")
     parser.add_argument("--weight_decay", default=0.01, type=float, help="weight decay")
     parser.add_argument("--beta1", default=0.9, type=float, help="beta1 parameter for Adam optimizer")
@@ -240,6 +262,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--warmup_steps", type=int, default=2000,
                         help="Number of warmup accumulation-steps for learning rate .")
+    parser.add_argument("--seq_len", type=int, default=2048, help="The sequence length of input.")
     parser.add_argument("--max_steps", type=int, help="Maximum total accumulation-steps to run.")
     parser.add_argument("--grad_accum_usteps", type=int, default=1,
                         help="Gradient accumulation micro-steps (an accumulation-step has <value> micro-steps.")
@@ -247,24 +270,31 @@ if __name__ == '__main__':
                         help="Uses (HF style) RMSNorm instead of the custom one that normalizes independently for each of the n_groups.")
     parser.add_argument("--debug", "-d", action="store_true",
                         help="Enable Neuron debugging flags to dump model graph and compiler logs.")
+    parser.add_argument("--logging_interval", default=1, type=int,
+                        help="logging every N steps.")
+    parser.add_argument("--checkpoint_load", action="store_true", help="Load checkpoint.")
+    parser.add_argument("--checkpoint_load_dir", type=str, default="./", help="ckpt loading dir.")
+    parser.add_argument("--checkpoint_load_tag", type=str, default="exp", help="ckpt loading name.")
     parser.add_argument("--checkpoint_freq", type=int, help="ckpt save freq.")
     parser.add_argument("--checkpoint_dir", type=str, default="./", help="ckpt saving dir")
+    parser.add_argument("--num_kept_checkpoint", type=int, default=-1, 
+                        help="number of checkpoints kept, old checkpoint will get deleted")
+    parser.add_argument("--save_last_step", action="store_true", help="save the checkpoint of the last training step.")
+    parser.add_argument("--output_dir", type=str, default="tensorboard_logs", help="tensorboard log saving dir")
     parser.add_argument("--tag", type=str, default="exp", help="ckpt saving name")
 
     args = parser.parse_args()
 
     os.environ["NEURON_RT_STOCHASTIC_ROUNDING_EN"] = "0"
     args.dtype = getattr(torch, args.dtype)
+    print(f"training data type: {args.dtype}")
 
     if args.dtype == torch.bfloat16:
         modeling_utils.get_parameter_dtype = lambda x: torch.bfloat16
 
     if args.debug:
-        # Debug flags to dump the annotated HLO graph, useful for profiling
         os.environ["XLA_IR_DEBUG"] = "1"
         os.environ["XLA_HLO_DEBUG"] = "1"
         os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
-
-    os.environ["NEURON_CC_FLAGS"] = " --model-type=transformer -O1"
 
     init_processes(args, backend=args.backend)

@@ -14,7 +14,7 @@ export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
 # HOST OOM
 export MALLOC_ARENA_MAX=64
 
-MODEL_SIZE="7B"
+MODEL_SIZE="8B"
 # vocab size
 VOCAB_SIZE=50288  # change based on tokenizer used to prepare the dataset
 # TP degree
@@ -32,7 +32,7 @@ TOTAL_STEPS=28000    # change as needed
 # warmup steps
 WARMUP_STEPS=1500   # change as needed
 # learning rate
-LR=3.0e-4
+LR=2.0e-4
 # data path
 DATA_PATH="$1"
 # save path
@@ -119,11 +119,11 @@ CMD_PREFIX="torchrun $DISTRIBUTED_ARGS "
 
 SCRIPT_PATH=$SCRIPT_DIR/train.py
 
-CHECKPOINT_TAG=mamba2${MODEL_SIZE}_bf16_zero1_lr${LR}_cossche_seq${SEQUENCE_LEN}_accu${ACC_STEPS}_bs${MBS}_beta09095_wd01
+CHECKPOINT_TAG=Mamba2Hybrid${MODEL_SIZE}_bf16_zero1_lr${LR}_cossche_seq${SEQUENCE_LEN}_accu${ACC_STEPS}_bs${MBS}_beta09095_wd01
 
 $CMD_PREFIX $SCRIPT_PATH \
     --tp $TP_DEGREE \
-    --model Mamba${MODEL_SIZE} \
+    --model Mamba2Hybrid${MODEL_SIZE} \
     --data_dir $DATA_PATH \
     --max_steps $TOTAL_STEPS \
     --dtype bfloat16 \

@@ -1,3 +1,6 @@
 transformers>=4.46.0
 einops
 datasets==2.19.1
+neuronx-cc==2.16*
+torch-neuronx==1.13.*
+neuronx_distributed==0.10.0

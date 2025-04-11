@@ -1,6 +1,6 @@
 # coding=utf-8
-# Copyright 2025 state-spaces/mamba2 org and HuggingFace Inc. team.
-# Modifications Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2024 state-spaces/mamba2 org and HuggingFace Inc. team.
+# Modifications Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,14 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch MAMBA2 model."""
+"""
+Adaptation of transformers.models.mamba2.modeling_mamba2 to be compatible with neuronx-distributed and implement a
+Mamba2Hybrid model.
+"""
 
-import os
+
 import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional, Tuple, Union
-import torch_xla.core.xla_model as xm
 
 import torch
 import torch.utils.checkpoint
@@ -30,6 +32,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.types import Device
 import torch.distributed as distrib
+import torch_xla.core.xla_model as xm
 
 
 from transformers.generation import GenerationMixin
@@ -42,11 +45,15 @@ from transformers.utils import (
     logging,
 )
 
-from .configuration_mamba2 import Mamba2Config
-from .mamba2_mixer import Mamba2Mixer
+from .configuration_mamba2hybrid import Mamba2HybridConfig
+from .mamba2hybrid_mlp import Mamba2HybridMLP
+from .mamba2hybrid_attn import Mamba2HybridAttention
+from .mamba2hybrid_layer_allocation import allocate_layers
+from .mamba2hybrid_layer_allocation import Symbols as LayerSymbols
 
-from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache, MAMBA2_START_DOCSTRING, \
-    MAMBA2_INPUTS_DOCSTRING, Mamba2CausalLMOutput   
+from mamba2.mamba2_mixer import Mamba2Mixer
+
+from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache
 from transformers.models.mamba2.modeling_mamba2 import Mamba2RMSNorm as Mamba2RMSNormHF
 from neuronx_distributed.parallel_layers import mappings
 
@@ -58,10 +65,32 @@ causal_conv1d_update, causal_conv1d_fn = None, None
 
 
 _CHECKPOINT_FOR_DOC = "mistralai/mamba-codestral-7B-v0.1"
-_CONFIG_FOR_DOC = "Mamba2Config"
+_CONFIG_FOR_DOC = "Mamba2HybridConfig"
+
 
 def _init_normal(std, w):
     return nn.init.normal_(w, mean=0.0, std=std)
+
+
+class Mamba2RMSNorm(Mamba2RMSNormHF):
+    def __init__(self, hidden_size, eps=1e-6, sequence_parallel_enabled=False):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__(hidden_size, eps=eps)
+        setattr(self.weight, "sequence_parallel_enabled", sequence_parallel_enabled)
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        # if os.environ.get("XLA_DOWNCAST_BF16", None) == "1":
+        #     hidden_states = hidden_states.to(torch.double)
+        # else:
+        hidden_states = hidden_states.to(torch.float32)
+        self.variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(self.variance + self.variance_epsilon)
+        output = self.weight * hidden_states
+        return output.to(input_dtype)
+
 
 class PartitionBreak(torch.autograd.Function):
     """Workaround to help the compiler detect layers.
@@ -79,38 +108,29 @@ class PartitionBreak(torch.autograd.Function):
     def backward(ctx, d_output):
         return torch.clamp(d_output, min=None, max=torch.inf)
 
+
 def partition_break(x):
     return PartitionBreak.apply(x)
 
 
-class Mamba2RMSNorm(Mamba2RMSNormHF):
-    def __init__(self, hidden_size, eps=1e-6, sequence_parallel_enabled=False):
-        """
-        LlamaRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__(hidden_size, eps=eps)
-        setattr(self.weight, "sequence_parallel_enabled", sequence_parallel_enabled)
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        if os.environ.get("XLA_DOWNCAST_BF16", None) == "1":
-            hidden_states = hidden_states.to(torch.double)
-        else:
-            hidden_states = hidden_states.to(torch.float32)
-        self.variance = hidden_states.pow(2).mean(-1, keepdim=True)         
-        hidden_states = hidden_states * torch.rsqrt(self.variance + self.variance_epsilon)
-        output = self.weight * hidden_states
-        return output.to(input_dtype)
-
-
-class Mamba2Block(nn.Module):
-    def __init__(self, config, layer_idx):
+class Mamba2HybridBlock(nn.Module):
+    """Simple block wrapping Mixer block with normalization and residual connection."""
+    def __init__(self, config, layer_type, layer_idx):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.layer_type = layer_type
         self.residual_in_fp32 = config.residual_in_fp32
         self.norm = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon, sequence_parallel_enabled=config.sequence_parallel_enabled)
-        self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
+
+        if layer_type == LayerSymbols.MAMBA:
+            self.layer = Mamba2Mixer(config, layer_idx=layer_idx)
+        elif layer_type == LayerSymbols.ATTENTION:
+            self.layer = Mamba2HybridAttention(config, layer_idx=layer_idx)
+        elif layer_type == LayerSymbols.MLP:
+            self.layer = Mamba2HybridMLP(config, layer_idx=layer_idx)
+        else:
+            raise ValueError(f"Unrecognized layer symbol: {layer_type}")
 
     def forward(
             self,
@@ -120,35 +140,36 @@ class Mamba2Block(nn.Module):
             attention_mask: Optional[torch.Tensor] = None,
     ):
         residual = hidden_states
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
-        hidden_states = self.mixer(
-            hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask
-        )
+        if self.layer_type == LayerSymbols.MAMBA:
+            hidden_states = self.layer(
+                hidden_states, cache_params=cache_params, cache_position=cache_position,
+                attention_mask=attention_mask
+            )
+        elif self.layer_type == LayerSymbols.ATTENTION:
+            hidden_states = self.layer(hidden_states, attention_mask=attention_mask)[0]
+        elif self.layer_type == LayerSymbols.MLP:
+            hidden_states = self.layer(hidden_states)
+        else:
+            raise ValueError(f"Unrecognized layer symbol: {self.layer_type}")
+
         hidden_states = residual + hidden_states
+
         return hidden_states
 
-    def step(self, x, cache_params: Optional[Mamba2Cache] = None):
-        residual = x
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
-        hidden_states = self.mixer.step(self.norm(x), cache_params=cache_params)
-        output = hidden_states + residual
 
-        return output
-
-
-class Mamba2PreTrainedModel(PreTrainedModel):
+class Mamba2HybridPreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
 
-    config_class = Mamba2Config
+    config_class = Mamba2HybridConfig
     base_model_prefix = "backbone"
-    _no_split_modules = ["Mamba2Block"]
+    _no_split_modules = ["Mamba2HybridBlock"]
     supports_gradient_checkpointing = True
     _is_stateful = True
 
@@ -188,10 +209,10 @@ class Mamba2PreTrainedModel(PreTrainedModel):
 
 
 @dataclass
-# Copied from transformers.models.mamba.modeling_mamba.MambaOutput with MAMBA->MAMBA2,Mamba->Mamba2
-class Mamba2Output(ModelOutput):
+# Copied from transformers.models.mamba.modeling_mamba.MambaOutput with MAMBA->MAMBA2ATTN,Mamba->Mamba2Attn
+class Mamba2HybridOutput(ModelOutput):
     """
-    Class for the MAMBA2 model outputs.
+    Class for the MAMBA2Hybrid model outputs.
 
     Args:
         last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -213,21 +234,117 @@ class Mamba2Output(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 
+@dataclass
+# Copied from transformers.models.mamba.modeling_mamba.MambaCausalLMOutput with MAMBA->MAMBA2ATTN,Mamba->Mamba2Attn
+class Mamba2HybridCausalLMOutput(ModelOutput):
+    """
+    Base class for causal language model (or autoregressive) outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        cache_params (`Mamba2Cache`):
+            The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
+            avoid providing the old `input_ids`.
+
+            Includes both the State space model state matrices after the selective scan, and the Convolutional states
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    cache_params: Optional[Mamba2Cache] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+
+
+MAMBA2HYBRID_START_DOCSTRING = r"""
+
+    This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
+    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
+    etc.)
+
+    This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
+    Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
+    and behavior.
+
+    Parameters:
+        config ([`Mamba2HybridConfig`]): Model configuration class with all the parameters of the model.
+            Initializing with a config file does not load the weights associated with the model, only the
+            configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
+"""
+
+MAMBA2HYBRID_INPUTS_DOCSTRING = r"""
+    Args:
+        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
+            Indices of input sequence tokens in the vocabulary.
+
+            If `cache_params.seqlen_offset>0`, only `input_ids` that do not have their past calculated should be passed as
+            `input_ids`.
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
+
+            [What are input IDs?](../glossary#input-ids)
+        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
+            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
+            model's internal embedding lookup matrix.
+        cache_params (`Mamba2Cache`, *optional*):
+            If passed along, the model uses the previous state in all the blocks (which will give the output for the
+            `input_ids` provided as if the model add `state_input_ids + input_ids` as context).
+        use_cache (`bool`, *optional*):
+            If set to `True`, the `cache_params` is returned and can be used to quickly generate the next logits.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+        cache_position (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            The position of the current input in the cache. This is used to ensure that the cache is correctly updated.
+            If `cache_params` is passed, `cache_position` should also be passed.
+        attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+            [What are attention masks?](../glossary#attention-mask)
+"""
+
+
 @add_start_docstrings(
-    "The bare MAMBA2 Model transformer outputting raw hidden-states without any specific head on top.",
-    MAMBA2_START_DOCSTRING,
+    "The bare MAMBA2ATTN Model transformer outputting raw hidden-states without any specific head on top.",
+    MAMBA2HYBRID_START_DOCSTRING,
 )
-class Mamba2Model(Mamba2PreTrainedModel):
+class Mamba2HybridModel(Mamba2HybridPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
         init_method = partial(_init_normal, config.initializer_range)
-        self.embeddings = ParallelEmbedding(config.vocab_size, config.hidden_size, init_method=init_method, dtype=config.dtype)
+        self.embeddings = ParallelEmbedding(config.vocab_size, config.hidden_size, init_method=init_method)
+        self.sequence_parallel_enabled = config.sequence_parallel_enabled
 
-        self.layers = nn.ModuleList([Mamba2Block(config, layer_idx=idx) for idx in range(config.num_hidden_layers)])
+        self.layer_allocation = allocate_layers(
+            total_layers_count=config.num_hidden_layers,
+            target_attention_ratio=config.hybrid_attention_ratio,
+            target_mlp_ratio=config.hybrid_mlp_ratio,
+            override_pattern=config.hybrid_override_pattern,
+        )
+
+        print('### Layer allocation: ', self.layer_allocation)
+
+        self.layers = nn.ModuleList([
+            Mamba2HybridBlock(config, layer_type=layer_type, layer_idx=layer_idx)
+                    for layer_idx, layer_type in enumerate(self.layer_allocation)
+        ])
 
         self.gradient_checkpointing = False
-        self.sequence_parallel_enabled = config.sequence_parallel_enabled
         self.norm_f = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon, sequence_parallel_enabled=config.sequence_parallel_enabled)
         # Initialize weights and apply final processing
         self._register_load_state_dict_pre_hook(self.load_hook)
@@ -245,10 +362,10 @@ class Mamba2Model(Mamba2PreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.embeddings = new_embeddings
 
-    @add_start_docstrings_to_model_forward(MAMBA2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MAMBA2HYBRID_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=Mamba2Output,
+        output_type=Mamba2HybridOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
@@ -262,7 +379,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
             cache_position: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             **kwargs,
-    ) -> Union[Tuple, Mamba2Output]:
+    ) -> Union[Tuple, Mamba2HybridOutput]:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -328,40 +445,26 @@ class Mamba2Model(Mamba2PreTrainedModel):
         if not return_dict:
             return tuple(v for v in [hidden_states, cache_params, all_hidden_states] if v is not None)
 
-        return Mamba2Output(
+        return Mamba2HybridOutput(
             last_hidden_state=hidden_states,
             cache_params=cache_params if use_cache else None,
             hidden_states=all_hidden_states,
         )
 
-    def step(self, input_ids, cache_params: Optional[Mamba2Cache] = None):
-        """Forward pass of the backbone.
-
-        :param input_ids: int64 (batch_size, 1) Batch of single tokens from tokenizer
-        """
-        x = self.embeddings(input_ids)  # (B, L, D)
-
-        for i, mixer_block in enumerate(self.layers):
-            x = PartitionBreak.apply(mixer_block.step(x, cache_params=cache_params))
-            xm.mark_step()
-
-        hidden_states = self.norm_f(x)
-
-        return hidden_states
 
 @add_start_docstrings(
     """
-    The MAMBA2 Model transformer with a language modeling head on top (linear layer with weights not tied to the input
-    embeddings).
+    The MAMBA2HYBRID Model transformer with a language modeling head on top (linear layer with weights not tied to the 
+    input embeddings).
     """,
-    MAMBA2_START_DOCSTRING,
+    MAMBA2HYBRID_START_DOCSTRING,
 )
-class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
+class Mamba2HybridForCausalLM(Mamba2HybridPreTrainedModel, GenerationMixin):
     _tied_weights_keys = []
 
     def __init__(self, config):
         super().__init__(config)
-        self.backbone = Mamba2Model(config)
+        self.backbone = Mamba2HybridModel(config)
         # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         init_method = partial(_init_normal, config.initializer_range)
         self.lm_head = ColumnParallelLinear(
@@ -370,11 +473,10 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
             bias=False,
             gather_output=False,
             init_method=init_method,
-            dtype=config.dtype,
             sequence_parallel_enabled=config.sequence_parallel_enabled,
             sequence_dimension=1,
         )
-        self.sequence_parallel_enabled = config.sequence_parallel_enabled
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -456,10 +558,10 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
         )
         return model_inputs
 
-    @add_start_docstrings_to_model_forward(MAMBA2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MAMBA2HYBRID_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=Mamba2CausalLMOutput,
+        output_type=Mamba2HybridCausalLMOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
@@ -474,7 +576,7 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
             cache_position: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             **kwargs,  # for now we need this for generation
-    ) -> Union[Tuple, Mamba2CausalLMOutput]:
+    ) -> Union[Tuple, Mamba2HybridCausalLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
@@ -483,7 +585,7 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        mamba2_outputs = self.backbone(
+        mamba2hybrid_outputs = self.backbone(
             input_ids,
             cache_params=cache_params,
             inputs_embeds=inputs_embeds,
@@ -493,7 +595,7 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             attention_mask=attention_mask,
         )
-        hidden_states = mamba2_outputs[0]
+        hidden_states = mamba2hybrid_outputs[0]
 
         logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
 
@@ -510,22 +612,12 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
             loss = loss.mean()
 
         if not return_dict:
-            output = (logits,) + mamba2_outputs[1:]
+            output = (logits,) + mamba2hybrid_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return Mamba2CausalLMOutput(
+        return Mamba2HybridCausalLMOutput(
             loss=loss,
             logits=logits,
-            cache_params=mamba2_outputs.cache_params,
-            hidden_states=mamba2_outputs.hidden_states,
+            cache_params=mamba2hybrid_outputs.cache_params,
+            hidden_states=mamba2hybrid_outputs.hidden_states,
         )
-
-    def step(self, idx, cache_params: Optional[Mamba2Cache] = None):
-        """Forward pass of the model.
-
-        :param idx: int64 (batch_size, 1) Sequence of input ids from the tokenizer
-        """
-        hidden_states = self.backbone.step(idx, cache_params=cache_params)
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
-
-        return logits

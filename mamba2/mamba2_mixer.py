@@ -1,6 +1,6 @@
 # coding=utf-8
-# Copyright 2024 state-spaces/mamba2 org and HuggingFace Inc. team.
-# Modifications Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2025 state-spaces/mamba2 org and HuggingFace Inc. team.
+# Modifications Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,22 +27,24 @@ import neuronx_distributed.parallel_layers.parallel_state as ps
 from neuronx_distributed.parallel_layers import RowParallelLinear, ColumnParallelLinear
 
 from .configuration_mamba2 import Mamba2Config
+from .fused_kernel import mamba2_fused_kernel
 
-from .mamba2_kernel import mamba2_kernel
 from .conv1d_grouped import ConvNKI
+from mamba2.mamba2_kernel_inference import mamba2_kernel_inference
 
 
 def softplus(x, threshold=10):
+    # FIXME: an (inefficient) workaround since F.softplus was computing the identity function in Trainium
     return torch.where(x < threshold, torch.log(1 + torch.exp(x)), x)
 
 
-# Note: this implementation is different from the same module in `transformers` when n_groups>1
-#       we normalize each channel group independently, while the original normalizes all channels in the same device
-#       regardless of their group. Our version ensures that the checkpoint will behave the same when used with
-#       a different tp degrees than during training (note however that using a large n_groups with few channels may
-#       introduce training instabilities).
+# Note: this is different from the same module in `transformers` when n_groups>1
+#       this module does the normalization independently for each group,
+#       while the original does not care about groups and would give different
+#       results for different tp degrees
 class MambaRMSNormGated(nn.Module):
-    def __init__(self, d: int, eps: float = 1e-5, device: Device = None, n_groups: int = 1, rmsnorm_within_groups=True):
+    def __init__(self, d: int, eps: float = 1e-5, device: Device = None, n_groups: int = 1, rmsnorm_within_groups=True,
+                 name=None, hidden_size=None):
         """Gated Root Mean Square Layer Normalization with support for groups
 
         Paper: https://arxiv.org/abs/1910.07467
@@ -54,15 +56,30 @@ class MambaRMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(d, device=device))
         self.n_groups = n_groups
         self.rmsnorm_within_groups = rmsnorm_within_groups
+        self.name = name
+        self.hidden_size = hidden_size
         self.parallel_split()
 
     def parallel_split(self):
-        # Split weights across cores based on the current tensor parallelism rank.
         tp_rank = ps.get_tensor_model_parallel_rank()
         tp_size = ps.get_tensor_model_parallel_size()
         dim = self.weight.shape[0]
-        assert dim % tp_size == 0
-        assert self.n_groups % tp_size == 0
+
+        # Special case for TP=1 with merged checkpoint
+        if not self.training and tp_size == 1:
+            if 'mixer.norm' in self.name:
+                # For mixer norm - keep the full concatenated weights (8192)
+                assert dim == self.hidden_size * 2, f"Expected mixer norm weight size {self.hidden_size * 2}, got {dim}"
+            else:
+                # For layer norm - use just one copy (4096)
+                if dim != self.hidden_size:
+                    assert dim == self.hidden_size * 2, f"Expected layer norm weight size {self.hidden_size} or {self.hidden_size * 2}, got {dim}"
+                    self.weight.data = self.weight.data[:self.hidden_size].detach().clone()
+            return self
+
+        # Original TP logic for training
+        assert dim % tp_size == 0, f"Weight dimension {dim} must be divisible by tp_size {tp_size}"
+        assert self.n_groups % tp_size == 0, f"Number of groups {self.n_groups} must be divisible by tp_size {tp_size}"
         self.n_groups = self.n_groups // tp_size
         chunk = slice(dim // tp_size * tp_rank, dim // tp_size * (tp_rank + 1))
         self.weight.data = self.weight.data[chunk].detach().clone()
@@ -73,19 +90,18 @@ class MambaRMSNormGated(nn.Module):
 
         if self.rmsnorm_within_groups:
             hidden_states = rearrange(hidden_states, "... (g d) -> ... g d", g=self.n_groups)
-            gate = rearrange(gate, "... (g d) -> ... g d", g=self.n_groups)
+            if gate is not None:
+                gate = rearrange(gate, "... (g d) -> ... g d", g=self.n_groups)
 
         if gate is not None:
             hidden_states = hidden_states * nn.functional.silu(gate.to(torch.float32))
 
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-
+        
         if self.rmsnorm_within_groups:
-            res = self.weight * rearrange(hidden_states, "... g d -> ... (g d)", g=self.n_groups)
-        else:
-            res = self.weight * hidden_states
-
+            hidden_states = rearrange(hidden_states, "... g d -> ... (g d)", g=self.n_groups)
+        res = self.weight * hidden_states
         return res
 
 
@@ -121,13 +137,12 @@ class Mamba2Mixer(nn.Module):
         self.time_step_limit = config.time_step_limit
         self.time_step_min = config.time_step_min
         self.time_step_max = config.time_step_max
+        self.sequence_parallel_enabled = config.sequence_parallel_enabled
 
         assert self.intermediate_size % self.head_dim == 0
         assert self.intermediate_size // self.head_dim == self.num_heads
 
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
-        # This is a custom replacement of a grouped conv1d written as a NKI kernel for better efficiency.
-        # Note: the SiLU non-linearity is already applied inside the kernel.
         self.conv1d = ConvNKI(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -135,14 +150,12 @@ class Mamba2Mixer(nn.Module):
             kernel_size=config.conv_kernel,
             groups=self.conv_dim,
             padding=config.conv_kernel - 1,
-            activation='silu',
         )
 
         # projection of the input hidden states
-        self.in_proj_z = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=config.use_bias, gather_output=False)
-        self.in_proj_xBC = ColumnParallelLinear(self.hidden_size, self.conv_dim, bias=config.use_bias, gather_output=False)
-        self.in_proj_dt = ColumnParallelLinear(self.hidden_size, self.num_heads, bias=config.use_bias, gather_output=False)
-
+        self.in_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size + self.conv_dim + self.num_heads, 
+                                            bias=config.use_bias, gather_output=False, dtype=config.dtype,
+                                            sequence_parallel_enabled=config.sequence_parallel_enabled, sequence_dimension=1)
         # time step projection (discretization)
         dt = torch.exp(
             torch.rand(config.num_heads)
@@ -159,16 +172,24 @@ class Mamba2Mixer(nn.Module):
         A = torch.arange(1, self.num_heads + 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
-        self.norm = MambaRMSNormGated(self.intermediate_size, eps=self.layer_norm_epsilon, n_groups=self.n_groups, rmsnorm_within_groups=self.rmsnorm_within_groups)
+        self.norm = MambaRMSNormGated(
+            self.intermediate_size,
+            eps=self.layer_norm_epsilon,
+            n_groups=self.n_groups,
+            rmsnorm_within_groups=self.rmsnorm_within_groups,
+            name=f"backbone.layers.{layer_idx}.mixer.norm",
+            hidden_size=config.hidden_size  # Pass hidden_size from config
+        )
         self.D = nn.Parameter(torch.ones(self.num_heads))
         self.D._no_weight_decay = True
 
-        self.out_proj = RowParallelLinear(self.intermediate_size, self.hidden_size, bias=config.use_bias, input_is_parallel=True)
+        self.out_proj = RowParallelLinear(self.intermediate_size, self.hidden_size, 
+                                          bias=config.use_bias, input_is_parallel=True, dtype=config.dtype,
+                                          sequence_parallel_enabled=config.sequence_parallel_enabled, sequence_dimension=1)
         self.use_bias = config.use_bias
         self.parallel_split()
 
     def parallel_split(self):
-        # Split weights across cores based on the current tensor parallelism rank.
         tp_rank = ps.get_tensor_model_parallel_rank()
         tp_size = ps.get_tensor_model_parallel_size()
         assert self.intermediate_size % tp_size == 0
@@ -178,7 +199,7 @@ class Mamba2Mixer(nn.Module):
         self.num_heads_tp = self.num_heads // tp_size
         self.conv_dim_tp = self.conv_dim // tp_size
         head_chunk = slice(self.num_heads_tp * tp_rank, self.num_heads_tp * (tp_rank + 1))
-        # note: we have to use .clone(), otherwise the result would be a view and the original would remain in memory
+        # note the .clone(), otherwise it would a view and would keep the original in memory
         self.D.data = self.D.data[head_chunk].detach().clone()
         self.A_log.data = self.A_log.data[head_chunk].detach().clone()
         self.dt_bias.data = self.dt_bias.data[head_chunk].detach().clone()
@@ -194,6 +215,7 @@ class Mamba2Mixer(nn.Module):
         # set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
         groups_time_state_size_tp = self.n_groups_tp * self.ssm_state_size
+        d_to_remove = 2 * self.intermediate_size + 2 * self.n_groups * self.ssm_state_size + self.num_heads
 
         assert cache_params is None, "cache not supported yet"
         assert self.training, "only training supported right now"
@@ -203,30 +225,11 @@ class Mamba2Mixer(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
 
-        gate = self.in_proj_z(hidden_states)
-        hidden_states_B_C = self.in_proj_xBC(hidden_states)
-        time_step = self.in_proj_dt(hidden_states)
-
-        # 1D Convolution (SiLU non-linearity is fused inside)
-        hidden_states_B_C = self.conv1d(input=hidden_states_B_C.transpose(1, 2)).transpose(1, 2)
-        hidden_states, B, C = torch.split(
-            hidden_states_B_C,
-            [self.intermediate_size_tp, groups_time_state_size_tp, groups_time_state_size_tp],
-            dim=-1,
-        )
-
-        time_step = softplus(time_step + self.dt_bias)
-
-        scan_output = mamba2_kernel(time_step,
-                                    A,
-                                    hidden_states.view(batch_size, seq_len, self.num_heads_tp, -1),
-                                    B.view(batch_size, seq_len, self.n_groups_tp, -1),
-                                    C.view(batch_size, seq_len, self.n_groups_tp, -1),
-                                    self.D)
-
-        scan_output = scan_output.view(batch_size, seq_len, -1)
-        # Multiply "gate" branch and apply extra normalization layer
-        scan_output = self.norm(scan_output, gate)
+        zxBCdt = self.in_proj(hidden_states)
+        scan_output = mamba2_fused_kernel(zxBCdt, A, self.D,
+                                       self.conv1d.weight, self.conv1d.bias,
+                                       self.dt_bias, self.norm.weight,
+                                       self.n_groups_tp, self.ssm_state_size, self.intermediate_size_tp, self.head_dim)
         out = self.out_proj(scan_output)
 
         return out
@@ -238,5 +241,42 @@ class Mamba2Mixer(nn.Module):
             cache_position: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
     ):
-        assert "xla" in self.in_proj_xBC.weight.device.type, "This model only supports forward on an XLA device"
+        assert "xla" in self.in_proj.weight.device.type, "This model only supports forward on an XLA device"
         return self.nki_kernels_forward(hidden_states, cache_params, cache_position, attention_mask)
+
+
+    def step(self, hidden_states, cache_params: Optional[Mamba2Cache] = None, ):
+        """
+        hidden_states: (B, 1, D)
+        Returns: same shape as hidden_states
+        """
+        batch, seqlen, dim = hidden_states.shape
+        assert (seqlen == 1)
+
+        zxBCdt = self.in_proj(hidden_states)
+
+        batch_size, seq_len, zxBCdt_size = zxBCdt.shape
+
+        n_groups, d_state, d_inner, d_head = self.n_groups_tp, self.ssm_state_size, self.intermediate_size_tp, self.head_dim
+        n_heads = d_inner // d_head
+        d_conv = d_inner + 2 * n_groups * d_state
+        assert zxBCdt_size == d_inner + d_conv + n_heads
+
+        z, xBC, dt = torch.split(zxBCdt, [d_inner, d_conv, n_heads], dim=-1)
+
+        dt = softplus(dt + self.dt_bias)
+
+        A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
+        y, new_conv_state, new_ssm_state = mamba2_kernel_inference(xBC, cache_params.conv_states[self.layer_idx],
+                                                                  self.conv1d.weight.squeeze(1), self.conv1d.bias,
+                                                                  cache_params.ssm_states[self.layer_idx], dt,
+                                                                  A, self.D, n_groups=self.n_groups_tp)
+
+        cache_params.conv_states[self.layer_idx] = new_conv_state
+        cache_params.ssm_states[self.layer_idx] = new_ssm_state
+
+        y = y.view(batch, seqlen, -1)
+        y = self.norm(y, z)
+        out = self.out_proj(y)
+
+        return out
