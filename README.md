@@ -61,7 +61,7 @@ torchrun --nproc_per_node 32 train.py  --tp 8  --model Mamba2Hybrid8B  --data_di
 ```
 The following script shows additional configuration options and can be adapted for multi-instance training.
 ```sh
-bash tp_zero1_hybridmamba2_8B_pretrain.sh DATA_DIR MODEL_SAVE_DIR
+bash tp_zero1_mamba2hybrid_8B_pretrain.sh DATA_DIR MODEL_SAVE_DIR
 ```
 
 ## For Developers
